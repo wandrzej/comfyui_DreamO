@@ -2,10 +2,11 @@ import torch
 from safetensors.torch import load_file as load_safetensors
 from diffusers import (
     AutoencoderKL,
-    CLIPTextModelWithProjection,
+    # CLIPTextModelWithProjection, # Removed from here
     FluxTransformer2DModel,
     FluxScheduler 
 )
+from diffusers.models import CLIPTextModelWithProjection # Added here
 from transformers import CLIPTokenizer
 import os
 import numpy as np
