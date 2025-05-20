@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import diffusers
@@ -27,7 +28,7 @@ from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
 from dreamo.transformer import flux_transformer_forward
-from dreamo.utils import convert_flux_lora_to_diffusers
+from .utils import convert_flux_lora_to_diffusers
 
 diffusers.models.transformers.transformer_flux.FluxTransformer2DModel.forward = flux_transformer_forward
 
@@ -39,69 +40,84 @@ def get_task_embedding_idx(task):
 class DreamOPipeline(FluxPipeline):
     def __init__(self, scheduler, vae, text_encoder, tokenizer, text_encoder_2, tokenizer_2, transformer):
         super().__init__(scheduler, vae, text_encoder, tokenizer, text_encoder_2, tokenizer_2, transformer)
-        self.t5_embedding = nn.Embedding(10, 4096)
-        self.task_embedding = nn.Embedding(2, 3072)
-        self.idx_embedding = nn.Embedding(10, 3072)
+        self.t5_embedding = None
+        self.task_embedding = None
+        self.idx_embedding = None
+        self.device = None # Will be set in load_dreamo_model_from_paths
 
-    def load_dreamo_model(self, device, use_turbo=True):
-        # download models and load file
-        hf_hub_download(repo_id='ByteDance/DreamO', filename='dreamo.safetensors', local_dir='models')
-        hf_hub_download(repo_id='ByteDance/DreamO', filename='dreamo_cfg_distill.safetensors', local_dir='models')
-        hf_hub_download(repo_id='ByteDance/DreamO', filename='dreamo_quality_lora_pos.safetensors', local_dir='models')
-        hf_hub_download(repo_id='ByteDance/DreamO', filename='dreamo_quality_lora_neg.safetensors', local_dir='models')
-        dreamo_lora = load_file('models/dreamo.safetensors')
-        cfg_distill_lora = load_file('models/dreamo_cfg_distill.safetensors')
-        quality_lora_pos = load_file('models/dreamo_quality_lora_pos.safetensors')
-        quality_lora_neg = load_file('models/dreamo_quality_lora_neg.safetensors')
+    def load_dreamo_model_from_paths(
+        self,
+        dreamo_weights_path,
+        turbo_weights_path=None,
+        cfg_distill_lora_path=None,
+        quality_pos_lora_path=None,
+        quality_neg_lora_path=None,
+        device_str='cpu'
+    ):
+        self.device = torch.device(device_str)
 
-        # load embedding
-        self.t5_embedding.weight.data = dreamo_lora.pop('dreamo_t5_embedding.weight')[-10:]
-        self.task_embedding.weight.data = dreamo_lora.pop('dreamo_task_embedding.weight')
-        self.idx_embedding.weight.data = dreamo_lora.pop('dreamo_idx_embedding.weight')
-        self._prepare_t5()
+        # Load Embeddings and DreamO LoRA
+        dreamo_data = load_file(dreamo_weights_path, device=self.device)
 
-        # main lora
-        dreamo_diffuser_lora = convert_flux_lora_to_diffusers(dreamo_lora)
-        adapter_names = ['dreamo']
-        adapter_weights = [1]
+        self.t5_embedding = nn.Embedding(10, 4096).to(self.device)
+        self.t5_embedding.weight.data = dreamo_data.pop('dreamo_t5_embedding.weight')[-10:]
+        
+        self.task_embedding = nn.Embedding(2, 3072).to(self.device)
+        self.task_embedding.weight.data = dreamo_data.pop('dreamo_task_embedding.weight')
+        
+        self.idx_embedding = nn.Embedding(10, 3072).to(self.device)
+        self.idx_embedding.weight.data = dreamo_data.pop('dreamo_idx_embedding.weight')
+        
+        self._prepare_t5() # Ensure text_encoder_2 and tokenizer_2 are already available
+
+        dreamo_diffuser_lora = convert_flux_lora_to_diffusers(dreamo_data)
         self.load_lora_weights(dreamo_diffuser_lora, adapter_name='dreamo')
+        adapter_names = ['dreamo']
+        adapter_weights = [1.0]
 
-        # cfg lora to avoid true image cfg
-        cfg_diffuser_lora = convert_flux_lora_to_diffusers(cfg_distill_lora)
-        self.load_lora_weights(cfg_diffuser_lora, adapter_name='cfg')
-        adapter_names.append('cfg')
-        adapter_weights.append(1)
+        # Load Optional LoRAs
+        if cfg_distill_lora_path and os.path.exists(cfg_distill_lora_path):
+            cfg_distill_lora_data = load_file(cfg_distill_lora_path, device=self.device)
+            cfg_diffuser_lora = convert_flux_lora_to_diffusers(cfg_distill_lora_data)
+            self.load_lora_weights(cfg_diffuser_lora, adapter_name='cfg')
+            adapter_names.append('cfg')
+            adapter_weights.append(1.0)
 
-        # turbo lora to speed up (from 25+ step to 12 step)
-        if use_turbo:
-            self.load_lora_weights(
-                hf_hub_download(
-                    "alimama-creative/FLUX.1-Turbo-Alpha", "diffusion_pytorch_model.safetensors", local_dir='models'
-                ),
-                adapter_name='turbo',
-            )
+        if turbo_weights_path and os.path.exists(turbo_weights_path):
+            # Assuming turbo_weights_path is a diffuser-compatible LoRA file
+            self.load_lora_weights(turbo_weights_path, adapter_name='turbo')
             adapter_names.append('turbo')
-            adapter_weights.append(1)
+            adapter_weights.append(1.0)
 
-        # quality loras, one pos, one neg
-        quality_lora_pos = convert_flux_lora_to_diffusers(quality_lora_pos)
-        self.load_lora_weights(quality_lora_pos, adapter_name='quality_pos')
-        adapter_names.append('quality_pos')
-        adapter_weights.append(0.15)
-        quality_lora_neg = convert_flux_lora_to_diffusers(quality_lora_neg)
-        self.load_lora_weights(quality_lora_neg, adapter_name='quality_neg')
-        adapter_names.append('quality_neg')
-        adapter_weights.append(-0.8)
+        if quality_pos_lora_path and os.path.exists(quality_pos_lora_path):
+            quality_pos_lora_data = load_file(quality_pos_lora_path, device=self.device)
+            quality_pos_lora = convert_flux_lora_to_diffusers(quality_pos_lora_data)
+            self.load_lora_weights(quality_pos_lora, adapter_name='quality_pos')
+            adapter_names.append('quality_pos')
+            adapter_weights.append(0.15)
 
-        self.set_adapters(adapter_names, adapter_weights)
-        self.fuse_lora(adapter_names=adapter_names, lora_scale=1)
-        self.unload_lora_weights()
+        if quality_neg_lora_path and os.path.exists(quality_neg_lora_path):
+            quality_neg_lora_data = load_file(quality_neg_lora_path, device=self.device)
+            quality_neg_lora = convert_flux_lora_to_diffusers(quality_neg_lora_data)
+            self.load_lora_weights(quality_neg_lora, adapter_name='quality_neg')
+            adapter_names.append('quality_neg')
+            adapter_weights.append(-0.8)
 
-        self.t5_embedding = self.t5_embedding.to(device)
-        self.task_embedding = self.task_embedding.to(device)
-        self.idx_embedding = self.idx_embedding.to(device)
+        # Apply LoRAs
+        if adapter_names: # Only if any LoRA was loaded
+            self.set_adapters(adapter_names, adapter_weights)
+            self.fuse_lora(adapter_names=adapter_names, lora_scale=1.0) # lora_scale=1.0 as per original
+            self.unload_lora_weights()
+        
+        # Embeddings are already on self.device due to .to(self.device) during initialization.
 
     def _prepare_t5(self):
+        if self.t5_embedding is None:
+            # This case should ideally not happen if load_dreamo_model_from_paths is called first.
+            # Consider raising an error or initializing t5_embedding here if it's a valid scenario.
+            print("Warning: _prepare_t5 called before t5_embedding was initialized.")
+            return
+
         self.text_encoder_2.resize_token_embeddings(len(self.tokenizer_2))
         num_new_token = 10
         new_token_list = [f"[ref#{i}]" for i in range(1, 10)] + ["[res]"]
